@@ -10,7 +10,7 @@ type Player<'input> =
   }
 
 type Rollbackistan<'state, 'input> =
-  { /// The maximum number of frames to roll back. Setting to 0 effectively disables delay-based networking.
+  { /// The maximum number of frames to roll back. Setting to 0 effectively disables rollback networking.
     /// 10 is said to be a good number for fighting games running at 60fps, as this provides ~160ms of rollback.
     predictionLimit: int
     /// The time by which to delay inputs. Setting to 0 effectively disables delay-based networking.
