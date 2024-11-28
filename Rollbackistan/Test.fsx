@@ -1,117 +1,205 @@
 type PlayerId = PlayerId of int
 
-type PlayerKind = Local | Remote | Spectator
-
 type Player<'input> =
-  { kind: PlayerKind
-    /// Player's inputs at the given frame number. Delayed inputs can exist in the future.
-    /// Any inputs older than `predictionLimit` ago are pruned during `update`.
-    inputs: Map<int, 'input>
-  }
+  { /// Player's inputs at the given frame number. Inputs can exist in the future, in which case they're delayed.
+    /// Any inputs older than `maxHistory` ago are pruned during `update`.
+    inputs: Map<int, 'input> }
+  member player.LastInput =
+    if player.inputs.IsEmpty then None
+    else
+      Some (Map.maxKeyValue player.inputs)
+  member player.LastInputAsOf time =
+    // TODO: https://github.com/fsharp/fslang-design/pull/734
+    Map.toSeq player.inputs
+    |> Seq.takeWhile (fun (id, _) -> id <= time)
+    |> Seq.rev
+    |> Seq.tryHead
 
 type Rollbackistan<'state, 'input> =
   { /// The maximum number of frames to roll back. Setting to 0 effectively disables rollback networking.
     /// 10 is said to be a good number for fighting games running at 60fps, as this provides ~160ms of rollback.
-    predictionLimit: int
-    /// The time by which to delay inputs. Setting to 0 effectively disables delay-based networking.
-    /// 2 appears to be a common value. This incurs ~32ms of latency at 60fps.
-    inputDelay: int
+    maxHistory: int
     /// The current time.
     realFrameIndex: int
     players: Map<PlayerId, Player<'input>>
-    /// All game states upto `predictionLimit` ago.
+    /// All game states upto `maxHistory` ago.
     history: 'state list
-    /// Predict the next input based on the given previous inputs. `List.head` is typically adequate.
-    /// May consider more inputs in the future, e.g. with state history.
-    /// This would allow for potentially more interesting predictions, e.g. that a player will move towards a powerup.
-    /// However, this is said not to yield significantly better results as known.
-    predict: 'input list -> 'input
-    /// Advance the simulation given the current state and the predicted and actual inputs of all registered players.
-    /// This function may be called upto a number of times given by `predictionLimit`.
-    advance: 'state -> Map<PlayerId, 'input> -> 'state
   }
-  
-  member this.getFrame index =
-    List.tryItem (this.realFrameIndex - index)
-    
-type UpdateResult<'state, 'input> =
-  | AwaitingPlayers of PlayerId list
-  | Advanced of Rollbackistan<'state, 'input> * 'state
 
-  static member make predictionLimit inputDelay predict advance =
-    { predictionLimit = predictionLimit
-      inputDelay = inputDelay
-      realFrameIndex = 0
-      players = Map.empty
-      history = []
-      predict = predict
-      advance = advance
-    }
-    
-let registerPlayer rollback playerId kind initInput =
-  if rollback.players.ContainsKey playerId then
-    failwith $"{playerId} already exists"
-  else
-    rollback.players.Add(playerId, { kind = kind; inputs = Map [ rollback.realFrameIndex, initInput ] })
-    
-let applyInput time rollback playerId input =
-  { rollback with
-      players = rollback.players.Change(playerId, Option.map (fun player ->
-        { player with inputs = player.inputs.Add(time, input) }))
-  }
-let applyLocalInputs rollback (inputs: Map<PlayerId, 'input>) =
-  let inputTime = rollback.inputDelay + rollback.realFrameIndex
-  
-  // add inputs to rollback player state and truncate
-  let rollback =
-    (rollback, inputs)
-    ||> Map.fold (applyInput inputTime)
-    
-  rollback, inputTime
- 
+type UpdateResult<'state, 'input> =
+  | AwaitingPlayers of Rollbackistan<'state, 'input> * PlayerId list
+  | Advanced of Rollbackistan<'state, 'input>
+
+let make<'state, 'input> maxHistory init : Rollbackistan<'state, 'input> =
+  { realFrameIndex = 0
+    players = Map.empty
+    maxHistory = maxHistory
+    history = [ init ] }
+
 /// Assumptions:
 /// - no inputs have been lost in transit (packets must be in order)
 /// - network inputs are sanitized to exclude local inputs (to prevent cheating)
-/// - players are already added
-let update (rollback: Rollbackistan<'state, 'input>)
+let update predict
+           advance
            (networkInputs: Map<int * PlayerId, 'input>)
+           (rollback: Rollbackistan<'state, 'input>)
            : UpdateResult<'state, 'input> =
-  let earliestInputtedFrame, earliestInput = Map.minKeyValue networkInputs
+             
+  let rollback = { rollback with realFrameIndex = rollback.realFrameIndex + 1}
   
-  match Map.tryFindKey (fun (_, pid) _ -> not (rollback.players.ContainsKey pid)) networkInputs with
-  | Some (_, pid) -> failwith $"Received input for unregistered player {pid}"
-  | _ -> ()
-  
+  let expireBefore = rollback.realFrameIndex - rollback.maxHistory
+
   // integrate inputs from network
   let rollback =
     (rollback, networkInputs)
-    ||> Map.fold (fun rollback (time, playerId) input -> applyInput time rollback playerId input)
-    
+    ||> Map.fold (fun rollback (time, playerId) input ->
+          { rollback with
+              players = rollback.players.Change(playerId, function
+                | Some player -> Some { player with inputs = player.inputs.Add(time, input) }
+                | None -> Some { inputs = Map [ time, input ] }) })
+
   // prune expired inputs
   let rollback =
-    let expireBefore = rollback.realFrameIndex - rollback.predictionLimit
     let players =
       rollback.players
       |> Map.map (fun _ player ->
-          { player with
-              inputs = player.inputs |> Map.filter (fun time _ -> time >= expireBefore ) })
+          let prunedInputs = player.inputs |> Map.filter (fun time _ -> time >= expireBefore )
+          let prunedInputs =
+            if prunedInputs.IsEmpty then Map [ Map.maxKeyValue player.inputs ]
+            else prunedInputs
+          { player with inputs = prunedInputs })
     { rollback with players = players }
-  
+
   // pause if prediction limit exceeded for any non-spectator player
   let stalledPlayers =
     rollback.players
-    |> Map.filter (fun _ p -> p.inputs.IsEmpty)
-    
+    |> Map.filter (fun _ p -> match p.LastInput with None -> false | Some (time, _) -> time < expireBefore)
+
   if not stalledPlayers.IsEmpty then
-    AwaitingPlayers (List.ofSeq stalledPlayers.Keys)
-    
+    AwaitingPlayers ({ rollback with realFrameIndex = rollback.realFrameIndex - 1 }, List.ofSeq stalledPlayers.Keys)
+
   else
-      
-    // fold best inputs on game state from last updated input until realFrameIndex (+1?)
+    let startTime =
+      networkInputs.Keys
+      |> Seq.tryHead
+      |> Option.map fst
+      |> Option.defaultValue rollback.realFrameIndex
     
+    // another player may not have sent inputs in this update, so predict those inputs up to starting frame
+    let startingInputs =
+      seq {
+        for p in rollback.players do
+          let playerId = p.Key
+          let player = p.Value
+          let inputTime, input =
+            match player.LastInputAsOf startTime with
+            | None -> failwith $"{playerId} has no input as of frame {startTime}"
+            | Some (inputTime, input) ->
+              inputTime, input
+          let input =
+            let rec predictLoop time input =
+              if time < startTime then
+                predictLoop (time + 1) (predict [ input ])
+              else
+                input
+            predictLoop inputTime input
+          playerId, input }
+      
+    let startState =
+      List.item (max 0 (rollback.realFrameIndex - startTime)) rollback.history
+      
+    // play back the game state from the earliest of the new inputs until the next real-time frame
+    let playback =
+      List.unfold (fun (state, inputs, time) ->
+        if time <= rollback.realFrameIndex then
+          let inputs =
+            inputs
+            |> Seq.map (fun (playerId, input) ->
+                match Map.tryFind time rollback.players[playerId].inputs with
+                | None ->
+                  playerId, predict [ input ]
+                | Some input ->
+                  playerId, input
+              )
+          let state = advance state (Map inputs)
+          Some (state, (state, inputs, time + 1))
+        else None)
+        
+    // update history with new played back state
+    let history =
+      playback (startState, startingInputs, startTime)
+      |> fun newHistory ->
+          (List.rev newHistory)@(List.skip (newHistory.Length - 1) rollback.history)
+          |> List.truncate rollback.maxHistory
     
     let rollback =
-      { rollback with history = List.truncate rollback.realFrameIndex rollback.history }
-    
-    Advanced (rollback, rollback.history.Head)
+      { rollback with
+          history = history }
+      
     // TODO: how to return commands in MMCC-friendly fashion?
+    
+    Advanced rollback
+ 
+type State =
+  { stateTime: int
+    player1Pressed: bool }
+ 
+type Input =
+  { buttonPressed: bool }
+
+let advance state (inputs: Map<PlayerId, Input>) =
+  let p1Pressed =
+    match Map.tryFind (PlayerId 1) inputs with
+    | None -> false
+    | Some input -> input.buttonPressed
+  { state with stateTime = state.stateTime + 1; player1Pressed = p1Pressed }
+
+let init = { stateTime = 1000; player1Pressed = false }
+
+let rollback =
+  make<State, Input> 5 init
+  
+let mapResult f = function
+  | Advanced rollback -> f rollback
+  | AwaitingPlayers (rollback, _) -> f rollback
+let (|%>) x y = x |> mapResult (update List.head advance y)
+
+// TODO: figure out if this works even if inputs come in in the wrong order (it should)
+// TODO: don't roll back if inputs are same as predicted
+// TODO: advance function should take more rollback state, e.g. current frame, whether it's a playback etc.
+// TODO: disconnect function
+// TODO: use generic PlayerId
+
+rollback
+|> update List.head advance (Map [ ]) 
+|%> Map [ (1, PlayerId 1), { buttonPressed = true } ]
+|%> Map [ ]
+|%> Map [ ]
+|%> Map [ ]
+|%> Map [ ]
+|%> Map [ ]
+|%> Map [ ]
+|%> Map [ ]
+|%> Map [ ]
+|%> Map [ ]
+|%> Map [ (7, PlayerId 1), { buttonPressed = false } ]
+// |%> Map [ (6, PlayerId 1), { buttonPressed = false } ]
+|%> Map [ ]
+|%> Map [ ]
+|%> Map [ ]
+
+(*
+
+Legend
+-  No input
+*  Player joined
+%  Player disconnected
+X  Button pressed state
+x  Button released state
+S  Stalled (until resumed)
+       S
+  01234567890123456789
+1 *----XXXXXxxxxxxxxx
+2     *--XXXX
+
+*)
